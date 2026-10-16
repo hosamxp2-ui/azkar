@@ -1,0 +1,97 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Prepare web files and embed fonts
+        run: |
+          mkdir -p www/fonts
+          cp index.html manifest.json icon-192.png icon-512.png www/
+          cat > fonts.mjs <<'EOF'
+          import fs from "fs";
+          import crypto from "crypto";
+          const UA = "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+          const url = "https://fonts.googleapis.com/css2?family=Amiri+Quran&family=Amiri&family=Noto+Naskh+Arabic&family=Scheherazade+New&family=Noto+Sans+Arabic&display=swap";
+          let css = await (await fetch(url, { headers: { "User-Agent": UA } })).text();
+          const urls = [...new Set([...css.matchAll(/url\((https:[^)]+)\)/g)].map(m => m[1]))];
+          for (const u of urls) {
+            const buf = Buffer.from(await (await fetch(u)).arrayBuffer());
+            const name = crypto.createHash("md5").update(u).digest("hex").slice(0, 10) + ".woff2";
+            fs.writeFileSync("www/fonts/" + name, buf);
+            css = css.split(u).join("fonts/" + name);
+          }
+          fs.writeFileSync("www/fonts.css", css);
+          let html = fs.readFileSync("www/index.html", "utf8");
+          html = html.replace(/<link[^>]*fonts\.(googleapis|gstatic)\.com[^>]*>/g, "");
+          html = html.replace("</head>", '<link rel="stylesheet" href="fonts.css"></head>');
+          fs.writeFileSync("www/index.html", html);
+          console.log("fonts embedded:", urls.length);
+          EOF
+          node fonts.mjs || echo "fonts step skipped"
+
+      - name: Create Capacitor Android project
+        run: |
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/local-notifications@6
+          npx cap init "أذكار المسلم" com.adhkar.muslim --web-dir=www
+          npx cap add android
+
+      - name: Customize Android (permissions, icon, notification icon)
+        run: |
+          python3 - <<'PY'
+          import os, shutil
+          man = "android/app/src/main/AndroidManifest.xml"
+          s = open(man, encoding="utf-8").read()
+          perms = ["POST_NOTIFICATIONS", "SCHEDULE_EXACT_ALARM", "USE_EXACT_ALARM", "VIBRATE",
+                   "RECEIVE_BOOT_COMPLETED", "ACCESS_COARSE_LOCATION", "ACCESS_FINE_LOCATION"]
+          add = "".join('    <uses-permission android:name="android.permission.%s" />\n' % p
+                        for p in perms if ("android.permission." + p) not in s)
+          s = s.replace("</manifest>", add + "</manifest>")
+          open(man, "w", encoding="utf-8").write(s)
+
+          res = "android/app/src/main/res"
+          shutil.rmtree(res + "/mipmap-anydpi-v26", ignore_errors=True)
+          for d in os.listdir(res):
+              if d.startswith("mipmap-"):
+                  for n in ("ic_launcher.png", "ic_launcher_round.png", "ic_launcher_foreground.png"):
+                      if os.path.exists("%s/%s/%s" % (res, d, n)):
+                          shutil.copy("icon-192.png", "%s/%s/%s" % (res, d, n))
+
+          os.makedirs(res + "/drawable", exist_ok=True)
+          icon = res + "/drawable/ic_stat_icon_config_sample.xml"
+          if not os.path.exists(icon):
+              open(icon, "w").write('''<vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF" android:pathData="M12,3a9,9 0 1,0 9,9c-5,2 -11,-4 -9,-9z"/>
+          </vector>
+          ''')
+          PY
+          npx cap sync android
+
+      - name: Build debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: adhkar-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
